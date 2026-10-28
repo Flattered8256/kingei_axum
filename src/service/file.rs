@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
+use futures::Stream;
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -10,7 +11,8 @@ use crate::repository::file::{FileRepository, NewThumbnail, ReadyMedia};
 use crate::serializer::file::{
     CreateFileRequest, FileResponse, PresignDownloadResponse, PresignUploadResponse,
 };
-use crate::storage::{ObjectStream, PRESIGN_TTL, Storage, parse_bytes_range};
+use crate::storage::sign::StorageOp;
+use crate::storage::{ObjectStream, PRESIGN_TTL, Storage, StorageError, parse_bytes_range};
 use crate::utils::media::{media_kind_from_content_type, probe_path, write_thumbnail};
 
 const MAX_NAME_CHARS: usize = 255;
@@ -64,7 +66,7 @@ impl FileService {
 
         let upload_url = match self
             .storage
-            .presign_put(&file.object_key, &file.content_type, file.size)
+            .upload_url(file.id, &file.object_key, &file.content_type, file.size)
             .await
         {
             Ok(url) => url,
@@ -225,7 +227,7 @@ impl FileService {
 
         let download_url = self
             .storage
-            .presign_get(&file.object_key, &file.content_type, &file.name)
+            .download_url(file.id, &file.object_key, &file.content_type, &file.name)
             .await?;
 
         Ok(PresignDownloadResponse {
@@ -248,6 +250,79 @@ impl FileService {
             .find_by_id(id)
             .await?
             .ok_or(AppError::File(FileError::FileNotFound))?;
+
+        if file.status != FileStatus::Ready {
+            return Err(AppError::File(FileError::FileNotReady));
+        }
+
+        let range = range_header.and_then(parse_bytes_range);
+        let object = self
+            .storage
+            .get_object(&file.object_key, range.as_deref())
+            .await?;
+
+        Ok(FileContent {
+            file,
+            object,
+            ranged: range.is_some(),
+        })
+    }
+
+    pub async fn upload_blob<S, B, E>(
+        &self,
+        id: i64,
+        token: &str,
+        stream: S,
+    ) -> Result<(), AppError>
+    where
+        S: Stream<Item = Result<B, E>> + Send,
+        B: AsRef<[u8]>,
+        E: std::fmt::Display,
+    {
+        if !self.storage.is_local() {
+            return Err(AppError::File(FileError::FileNotFound));
+        }
+
+        let file = self
+            .repo
+            .find_by_id(id)
+            .await?
+            .ok_or(AppError::File(FileError::FileNotFound))?;
+
+        self.storage
+            .verify_token(token, file.id, &file.object_key, StorageOp::Put)
+            .map_err(|_| AppError::File(FileError::InvalidStorageToken))?;
+
+        match self
+            .storage
+            .write_stream(&file.object_key, file.size, stream)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(StorageError::SizeMismatch) => Err(AppError::File(FileError::SizeMismatch)),
+            Err(e) => Err(AppError::Storage(e)),
+        }
+    }
+
+    pub async fn download_blob(
+        &self,
+        id: i64,
+        token: &str,
+        range_header: Option<&str>,
+    ) -> Result<FileContent, AppError> {
+        if !self.storage.is_local() {
+            return Err(AppError::File(FileError::FileNotFound));
+        }
+
+        let file = self
+            .repo
+            .find_by_id(id)
+            .await?
+            .ok_or(AppError::File(FileError::FileNotFound))?;
+
+        self.storage
+            .verify_token(token, file.id, &file.object_key, StorageOp::Get)
+            .map_err(|_| AppError::File(FileError::InvalidStorageToken))?;
 
         if file.status != FileStatus::Ready {
             return Err(AppError::File(FileError::FileNotReady));

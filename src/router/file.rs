@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
 use axum::{
-    Router, middleware,
-    routing::{get, post},
+    Router,
+    extract::DefaultBodyLimit,
+    middleware,
+    routing::{get, post, put},
 };
 
 use crate::handler::file;
@@ -20,5 +22,13 @@ pub fn protected_routes() -> Router<Arc<AppState>> {
         .route("/{id}/content", get(file::content))
         .layer(middleware::from_fn(auth::auth_bearer_or_cookie));
 
-    bearer.merge(content)
+    // 本地存储的上传/下载入口靠 URL 里的签名授权，不走 JWT，也不限制请求体大小。
+    let signed = Router::new()
+        .route(
+            "/{id}/blob",
+            put(file::upload_blob).get(file::download_blob),
+        )
+        .layer(DefaultBodyLimit::disable());
+
+    bearer.merge(content).merge(signed)
 }

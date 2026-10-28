@@ -12,12 +12,18 @@ use hyper_util::rt::TokioExecutor;
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::storage::{StorageBackend, backend_from_env};
+
 type ProxyClient = Client<hyper_util::client::legacy::connect::HttpConnector, Body>;
 
-struct Site {
+struct Proxy {
     bucket: String,
     endpoint: String,
     client: ProxyClient,
+}
+
+struct Site {
+    proxy: Option<Proxy>,
     files: ServeDir<ServeFile>,
 }
 
@@ -31,10 +37,17 @@ pub fn with_frontend(api: Router, static_dir: String) -> Router {
         );
     }
 
+    let proxy = match backend_from_env() {
+        StorageBackend::S3 => Some(Proxy {
+            bucket: require_bucket(),
+            endpoint: require_endpoint(),
+            client: Client::builder(TokioExecutor::new()).build_http(),
+        }),
+        StorageBackend::Local => None,
+    };
+
     let site = Arc::new(Site {
-        bucket: require_bucket(),
-        endpoint: require_endpoint(),
-        client: Client::builder(TokioExecutor::new()).build_http(),
+        proxy,
         // history 路由要和原先 nginx try_files 一样返回 200。not_found_service 会改成 404。
         files: ServeDir::new(&root).fallback(ServeFile::new(index)),
     });
@@ -80,11 +93,12 @@ fn require_endpoint() -> String {
 }
 
 async fn dispatch(State(site): State<Arc<Site>>, req: Request) -> Response {
-    if is_bucket_path(req.uri().path(), &site.bucket) {
-        proxy(&site, req).await
-    } else {
-        serve_files(&site, req).await
+    if let Some(proxy) = &site.proxy
+        && is_bucket_path(req.uri().path(), &proxy.bucket)
+    {
+        return proxy_request(proxy, req).await;
     }
+    serve_files(&site, req).await
 }
 
 async fn serve_files(site: &Site, req: Request) -> Response {
@@ -94,13 +108,13 @@ async fn serve_files(site: &Site, req: Request) -> Response {
     }
 }
 
-async fn proxy(site: &Site, req: Request) -> Response {
+async fn proxy_request(proxy: &Proxy, req: Request) -> Response {
     let path = req
         .uri()
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
-    let target = format!("{}{path}", site.endpoint);
+    let target = format!("{}{path}", proxy.endpoint);
     let Ok(uri) = target.parse::<Uri>() else {
         tracing::error!(target, "s3 proxy uri");
         return StatusCode::BAD_GATEWAY.into_response();
@@ -112,7 +126,7 @@ async fn proxy(site: &Site, req: Request) -> Response {
     parts.version = Version::HTTP_11;
     strip_hop_by_hop(&mut parts.headers);
 
-    match site.client.request(Request::from_parts(parts, body)).await {
+    match proxy.client.request(Request::from_parts(parts, body)).await {
         Ok(response) => {
             let (mut parts, body) = response.into_parts();
             strip_hop_by_hop(&mut parts.headers);
@@ -170,7 +184,7 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::is_bucket_path;
-    use super::{Client, ServeDir, ServeFile, Site, TokioExecutor};
+    use super::{Client, Proxy, ServeDir, ServeFile, Site, TokioExecutor};
     use axum::Router;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
@@ -202,9 +216,11 @@ mod tests {
         let index = dir.path().join("index.html");
         std::fs::write(&index, b"home").unwrap();
         let site = Arc::new(Site {
-            bucket: "kingei".to_string(),
-            endpoint: "http://127.0.0.1:9".to_string(),
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            proxy: Some(Proxy {
+                bucket: "kingei".to_string(),
+                endpoint: "http://127.0.0.1:9".to_string(),
+                client: Client::builder(TokioExecutor::new()).build_http(),
+            }),
             files: ServeDir::new(dir.path()).fallback(ServeFile::new(index)),
         });
         let api = Router::new()
@@ -239,6 +255,34 @@ mod tests {
 
         let page = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(
+            page.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_mode_does_not_proxy_bucket_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = dir.path().join("index.html");
+        std::fs::write(&index, b"home").unwrap();
+        let site = Arc::new(Site {
+            proxy: None,
+            files: ServeDir::new(dir.path()).fallback(ServeFile::new(index)),
+        });
+        let api = Router::new().route("/health", get(|| async { StatusCode::NO_CONTENT }));
+        let app = super::mount(api, site);
+
+        let page = app
+            .oneshot(
+                Request::builder()
+                    .uri("/kingei/a/b")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(page.status(), StatusCode::OK);

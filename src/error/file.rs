@@ -23,6 +23,8 @@ pub enum FileError {
     FileNotReady,
     #[error("InvalidImage")]
     InvalidImage,
+    #[error("InvalidStorageToken")]
+    InvalidStorageToken,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,6 +44,7 @@ impl IntoResponse for FileError {
             FileError::SizeMismatch => (StatusCode::BAD_REQUEST, self.to_string()),
             FileError::FileNotReady => (StatusCode::BAD_REQUEST, self.to_string()),
             FileError::InvalidImage => (StatusCode::BAD_REQUEST, self.to_string()),
+            FileError::InvalidStorageToken => (StatusCode::FORBIDDEN, self.to_string()),
         };
 
         (
