@@ -18,13 +18,12 @@ pub struct LocalStorage {
 
 impl LocalStorage {
     pub fn connect() -> Self {
-        let dir = env::var("STORAGE_DIR").expect("缺少STORAGE_DIR,请检查项目根目录下的.env文件");
-        let root = PathBuf::from(dir.trim());
+        let root = storage_dir_from_env();
         std::fs::create_dir_all(&root).expect("创建STORAGE_DIR失败");
         let root = std::fs::canonicalize(&root).expect("解析STORAGE_DIR失败");
         let tmp = root.join(".tmp");
         std::fs::create_dir_all(&tmp).expect("创建STORAGE_DIR/.tmp失败");
-        let base = public_base();
+        let base = public_base_from_env();
         let secret = storage_secret();
 
         tracing::info!(dir = %root.display(), base = %base, "local storage connected");
@@ -209,17 +208,40 @@ fn storage_secret() -> String {
         .expect("缺少STORAGE_SECRET或JWT_SECRET,请检查项目根目录下的.env文件")
 }
 
-fn public_base() -> String {
-    let raw = env::var("STORAGE_PUBLIC_BASE_URL")
-        .expect("缺少STORAGE_PUBLIC_BASE_URL,请检查项目根目录下的.env文件");
-    let base = raw.trim().trim_end_matches('/');
-    if !(base.starts_with("http://") || base.starts_with("https://"))
-        || base.contains(char::is_whitespace)
+fn storage_dir_from_env() -> PathBuf {
+    resolve_storage_dir(env::var("STORAGE_DIR").ok().as_deref())
+}
+
+fn resolve_storage_dir(configured: Option<&str>) -> PathBuf {
+    match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from("./data/files"),
+    }
+}
+
+fn public_base_from_env() -> String {
+    let configured = env::var("STORAGE_PUBLIC_BASE_URL").ok();
+    let has_static = env::var("STATIC_DIR").is_ok_and(|value| !value.trim().is_empty());
+    resolve_public_base(configured.as_deref(), has_static)
+}
+
+fn resolve_public_base(configured: Option<&str>, has_static: bool) -> String {
+    let Some(raw) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        // 缺省返回相对前缀：浏览器按当前域名解析，同源部署无需知道域名。
+        return if has_static {
+            "/api".to_string()
+        } else {
+            String::new()
+        };
+    };
+    let base = raw.trim_end_matches('/');
+    let illegal = base.contains(char::is_whitespace)
         || base.contains('?')
         || base.contains('#')
-    {
+        || !(base.starts_with("http://") || base.starts_with("https://") || base.starts_with('/'));
+    if illegal {
         panic!(
-            "STORAGE_PUBLIC_BASE_URL必须是http(s)://主机[:端口][/前缀],请检查项目根目录下的.env文件"
+            "STORAGE_PUBLIC_BASE_URL必须是http(s)://绝对地址或以/开头的相对前缀,请检查项目根目录下的.env文件"
         );
     }
     base.to_string()
@@ -379,6 +401,34 @@ mod tests {
         assert_eq!(parse_range_inner("bytes=-0", 10), None);
         assert_eq!(parse_range_inner("bytes=0-", 0), None);
         assert_eq!(parse_range_inner("items=0-1", 10), None);
+    }
+
+    #[test]
+    fn default_storage_dir() {
+        assert_eq!(resolve_storage_dir(None), PathBuf::from("./data/files"));
+        assert_eq!(
+            resolve_storage_dir(Some("  ")),
+            PathBuf::from("./data/files")
+        );
+        assert_eq!(
+            resolve_storage_dir(Some("/data/files")),
+            PathBuf::from("/data/files")
+        );
+    }
+
+    #[test]
+    fn default_public_base() {
+        assert_eq!(resolve_public_base(None, true), "/api");
+        assert_eq!(resolve_public_base(None, false), "");
+        assert_eq!(resolve_public_base(Some(""), true), "/api");
+        assert_eq!(
+            resolve_public_base(Some("http://example.com/"), false),
+            "http://example.com"
+        );
+        assert_eq!(
+            resolve_public_base(Some("/gateway/api"), false),
+            "/gateway/api"
+        );
     }
 
     #[test]
